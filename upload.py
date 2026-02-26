@@ -227,52 +227,39 @@ def find_adapter_dir(iter_override: int | None) -> tuple[Path, int | str]:
 def fuse_adapter(adapter_dir: Path) -> bool:
     """
     Run mlx_lm.fuse to merge LoRA weights into base model → MERGE_DIR.
-    --de-quantize produces clean FP16 output (not 4-bit).
+    Uses --dequantize (NOT --de-quantize) for FP16 output.
     Returns True on success.
     """
     MERGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n🔀  Merging LoRA → FP16 via mlx_lm.fuse")
+    print(f"\n🔀  Merging LoRA → FP16 via mlx_lm fuse")
     print(f"    adapter : {adapter_dir}/")
     print(f"    output  : {MERGE_DIR}/")
     print(f"    (takes 2-5 min...)\n")
 
-    # Try Python API first
-    try:
-        from mlx_lm import fuse
-        fuse(
-            model=MODEL_ID,
-            adapter_path=str(adapter_dir),
-            save_path=str(MERGE_DIR),
-            de_quantize=True,
-        )
-        print(f"\n    ✅  Merge complete")
-        return True
-    except Exception as e:
-        print(f"    ⚠️   Python API failed: {e}")
-        print(f"    Trying subprocess...")
-
-    # Fallback: subprocess (works even if Python API has version differences)
+    # mlx_lm.fuse is NOT a callable function — it's a CLI module.
+    # The correct invocation is: python -m mlx_lm fuse  (space, not dot)
+    # Note: --dequantize (no hyphen between de and quantize)
     result = subprocess.run(
-        [sys.executable, "-m", "mlx_lm.fuse",
+        [sys.executable, "-m", "mlx_lm", "fuse",
          "--model",        MODEL_ID,
          "--adapter-path", str(adapter_dir),
          "--save-path",    str(MERGE_DIR),
-         "--de-quantize"],
+         "--dequantize"],
         capture_output=False,
     )
 
     if result.returncode == 0:
-        print(f"\n    ✅  Merge complete (subprocess)")
+        print(f"\n    ✅  Merge complete")
         return True
 
     print(f"\n    ❌  Merge failed.")
     print(f"    Run manually:")
-    print(f"      python -m mlx_lm.fuse \\")
+    print(f"      python -m mlx_lm fuse \\")
     print(f"        --model {MODEL_ID} \\")
     print(f"        --adapter-path {adapter_dir} \\")
     print(f"        --save-path {MERGE_DIR} \\")
-    print(f"        --de-quantize")
+    print(f"        --dequantize")
     return False
 
 
@@ -282,8 +269,13 @@ def upload_merged(repo_id: str, iter_num) -> bool:
     print(f"    (uploading ~1GB, takes a few minutes...)")
     try:
         api = HfApi()
+
+        # Always create repo first — harmless if it already exists.
+        # Required for org repos (srmsit/...) which don't auto-create.
+        print(f"    Creating repo if needed...")
         api.create_repo(repo_id=repo_id, repo_type="model",
                         token=HF_TOKEN, exist_ok=True)
+        print(f"    ✅  Repo ready")
 
         # Write README into MERGE_DIR before upload
         readme = MERGE_DIR / "README.md"
