@@ -109,11 +109,11 @@ ALPHA      = 128        # = 2 × rank
 # IMPORTANT: unsloth-mlx counts raw forward-pass iterations, not optimizer
 # steps. grad_accum is passed through but iteration count = rows // BATCH.
 BATCH      = 2
-GRAD_ACCUM = 8          # passed to trainer, affects gradient quality
+GRAD_ACCUM = 8     #16     # passed to trainer, affects gradient quality
 
 LR         = 2e-4
 WARMUP     = 50         # absolute iterations
-MAX_ROWS   = 3500       # per split before pre-splitting expands them
+MAX_ROWS   = 3500 #3000      # per split before pre-splitting expands them
                         # 3500 × 3 splits × ~1.5x expansion ≈ 15,750 rows
                         # 15,750 / batch=2 × 2 epochs ≈ 15,750 iters ≈ 4.4h on M3
 TRIAL_ROWS = 50         # per split in trial mode
@@ -221,7 +221,7 @@ STRIDE = 1536   # overlap of 512 tokens between consecutive chunks
 # Why not MAX_SEQ itself? The tokenizer adds special tokens (BOS/EOS)
 # AFTER encoding, so a 2048-token encode can become 2049 after wrapping.
 # Splitting at 2046 leaves a 2-token buffer and eliminates the warning entirely.
-SPLIT_AT = MAX_SEQ - 2   # = 2046
+SPLIT_AT = MAX_SEQ - 8   # = 2046
 
 def split_long_rows(examples, tokenizer):
     """
