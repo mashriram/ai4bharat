@@ -1,48 +1,34 @@
 #!/usr/bin/env python3
 """
-╔═══════════════════════════════════════════════════════════════════════╗
-║   AI4BHARAT TUNE-ATHON  —  UPLOAD FULL MODEL                        ║
-║                                                                       ║
-║   Merges LoRA adapter into full FP16 model and uploads to Hub.       ║
-║   Works from: adapters/{STATE}/  OR  checkpoints/{STATE}/adapters/   ║
-║                                                                       ║
-║   USAGE:                                                              ║
-║     # Auto-detect adapter, merge, upload:                            ║
-║     python upload_model.py                                           ║
-║                                                                       ║
-║     # Use a specific adapter directory:                              ║
-║     python upload_model.py --adapter-path adapters/Tamil_Nadu        ║
-║                                                                       ║
-║     # Use a specific numbered checkpoint (not the rolling latest):   ║
-║     python upload_model.py --iter 3400                               ║
-║                                                                       ║
-║     # Merge only, don't upload (check it first):                     ║
-║     python upload_model.py --no-upload                               ║
-╚═══════════════════════════════════════════════════════════════════════╝
+AI4BHARAT TUNE-ATHON — Upload Full Model
+
+Merges LoRA adapter into full FP16 model and uploads to Hub.
+Patches mlx_lm on disk to fix the Qwen3 num_layers bug (one-time, persists).
+
+USAGE:
+  python upload_model.py                        # auto-detect, merge, upload
+  python upload_model.py --no-upload            # merge locally only
+  python upload_model.py --iter 3400            # use specific checkpoint iter
+  python upload_model.py --adapter-path PATH    # explicit adapter dir
+  python upload_model.py --keep-merged          # don't delete merged/ after upload
 """
 
-import os, sys, json, shutil, argparse, subprocess
+import os, sys, json, shutil, argparse, subprocess, site
 from pathlib import Path
 
-# ── Load .env ────────────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import load_dotenv; load_dotenv()
 except ImportError:
     pass
 
 from huggingface_hub import HfApi, login
 
-# ── Config — must match finetune.py exactly ───────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 def _require(k):
     v = os.getenv(k, "").strip()
-    if not v:
-        print(f"\n❌  Missing .env variable: {k}\n")
-        sys.exit(1)
+    if not v: print(f"\n❌  Missing .env: {k}\n"); sys.exit(1)
     return v
-
-def _opt(k, d):
-    return os.getenv(k, d).strip() or d
+def _opt(k, d): return os.getenv(k, d).strip() or d
 
 HF_TOKEN     = _require("HF_TOKEN")
 HF_USERNAME  = _require("HF_USERNAME")
@@ -53,105 +39,115 @@ MODEL_ID     = "mlx-community/Qwen3-1.7B-4bit"
 MAX_SEQ      = 2048
 RANK         = 64
 ALPHA        = 128
-LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"]
+LORA_MODULES = ["q_proj","k_proj","v_proj","o_proj",
+                "gate_proj","up_proj","down_proj"]
 
-# ── Paths ─────────────────────────────────────────────────────────────
-CKPT_ADAPT = Path(f"checkpoints/{STATE}/adapters")   # mid-run checkpoints
-ADAPT_DIR  = Path(f"adapters/{STATE}")               # clean saved adapter
-MERGE_DIR  = Path(f"merged/{STATE}")                 # fuse output
+CKPT_ADAPT = Path(f"checkpoints/{STATE}/adapters")
+ADAPT_DIR  = Path(f"adapters/{STATE}")
+MERGE_DIR  = Path(f"merged/{STATE}")
 
-# ── adapter_config.json ───────────────────────────────────────────────
-# unsloth-mlx only writes this at end of full training.
-# Mid-run checkpoint dirs only have raw .safetensors files.
-# mlx_lm.fuse needs this file — we generate it from our known params.
 ADAPTER_CONFIG = {
-    "alpha_pattern":           {},
-    "auto_mapping":            None,
-    "base_model_name_or_path": MODEL_ID,
-    "bias":                    "none",
-    "fan_in_fan_out":          False,
-    "inference_mode":          True,
-    "init_lora_weights":       True,
-    "layer_replication":       None,
-    "layers_pattern":          None,
-    "layers_to_transform":     None,
-    "loftq_config":            {},
-    "lora_alpha":              ALPHA,
-    "lora_dropout":            0.0,
-    "megatron_config":         None,
-    "megatron_core":           "megatron.core",
-    "modules_to_save":         None,
-    "peft_type":               "LORA",
-    "r":                       RANK,
-    "rank_pattern":            {},
-    "revision":                None,
-    "target_modules":          LORA_MODULES,
-    "task_type":               "CAUSAL_LM",
-    "use_dora":                False,
-    "use_rslora":              False,
+    "alpha_pattern": {}, "auto_mapping": None,
+    "base_model_name_or_path": MODEL_ID, "bias": "none",
+    "fan_in_fan_out": False, "inference_mode": True, "init_lora_weights": True,
+    "layer_replication": None, "layers_pattern": None, "layers_to_transform": None,
+    "loftq_config": {}, "lora_alpha": ALPHA, "lora_dropout": 0.0,
+    "megatron_config": None, "megatron_core": "megatron.core",
+    "modules_to_save": None, "peft_type": "LORA", "r": RANK,
+    "rank_pattern": {}, "revision": None, "target_modules": LORA_MODULES,
+    "task_type": "CAUSAL_LM", "use_dora": False, "use_rslora": False,
 }
 
-# ── README template ───────────────────────────────────────────────────
+# ── README ────────────────────────────────────────────────────────────
 def make_readme(repo_id, iter_num):
-    trained_on = f"iter {iter_num:,}" if isinstance(iter_num, int) else "full training"
+    trained = f"iter {iter_num:,}" if isinstance(iter_num, int) else str(iter_num)
     return f"""---
-language:
-- ta
+language: [ta]
 base_model: Qwen/Qwen3-1.7B
-tags:
-- fine-tuned
-- indian-languages
-- {STATE.lower().replace("_", "-")}
-- lora
-- ai4bharat
-- tune-athon
+tags: [fine-tuned, indian-languages, {STATE.lower().replace('_','-')}, lora, ai4bharat]
 license: apache-2.0
 ---
+# AI4Bharat State Expert — {STATE.replace('_',' ')}
+Fine-tuned Qwen3-1.7B on AI4Bharat Indic Languages dataset for {STATE.replace('_',' ')}.
+Trained at SRMIST Vadapalani AI4Bharat Tune-Athon (Feb 26, 2026). Checkpoint: {trained}.
 
-# AI4Bharat State Expert — {STATE.replace("_", " ")}
-
-Fine-tuned from [`{MODEL_ID}`](https://huggingface.co/{MODEL_ID}) on the
-[AI4Bharat Indic Languages and Cultures](https://huggingface.co/datasets/mashriram/AI4Bharat-Indic-Languages-and-Cultures)
-dataset for **{STATE.replace("_", " ")}**, as part of the
-AI4Bharat Tune-Athon event at SRMIST Vadapalani (Feb 26, 2026).
-
-Checkpoint: {trained_on}.
-
-## Training details
-| Parameter | Value |
+## Training
+| Param | Value |
 |---|---|
-| Base model | Qwen3-1.7B (4-bit quantized) |
-| LoRA rank | {RANK} |
-| LoRA alpha | {ALPHA} |
-| Target modules | {", ".join(LORA_MODULES)} |
-| Max sequence length | {MAX_SEQ} |
-| Dataset splits | indic + conv + cult |
-| Framework | unsloth-mlx |
-| Hardware | Apple M3 iMac 16GB |
+| Base | Qwen3-1.7B 4-bit | LoRA rank | {RANK} | Alpha | {ALPHA} |
+| Modules | {', '.join(LORA_MODULES)} | Seq len | {MAX_SEQ} |
+| Splits | indic + conv + cult | HW | Apple M3 iMac 16GB |
 
 ## Usage
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 model = AutoModelForCausalLM.from_pretrained("{repo_id}")
-tok   = AutoTokenizer.from_pretrained("{repo_id}")
-
-prompt = "<|im_start|>user\\n{STATE.replace('_',' ')} பற்றி சொல்லுங்கள்<|im_end|>\\n<|im_start|>assistant\\n"
-inputs = tok(prompt, return_tensors="pt")
-out    = model.generate(**inputs, max_new_tokens=200)
-print(tok.decode(out[0], skip_special_tokens=True))
+tok = AutoTokenizer.from_pretrained("{repo_id}")
 ```
-
-This is the **merged FP16 model** — no PEFT library required.
+Merged FP16 model — no PEFT required.
 """
 
 # ─────────────────────────────────────────────────────────────────────
-# HELPERS
+# PATCH mlx_lm ON DISK
+#
+# mlx_lm/tuner/utils.py does: config.num_layers
+# Qwen3's config.json uses "num_hidden_layers" — mlx_lm crashes.
+# We patch the installed file once. It persists for the whole session
+# and also fixes the subprocess call (which our in-process patches can't).
 # ─────────────────────────────────────────────────────────────────────
+def patch_mlx_lm_on_disk():
+    """
+    Find mlx_lm/tuner/utils.py in the active venv and patch the one line
+    that crashes on Qwen3: `config.num_layers` → safe getattr fallback.
+    Safe to run multiple times (checks if already patched).
+    """
+    # Find the file across all possible site-packages locations
+    candidates = []
+    for sp in site.getsitepackages() + [site.getusersitepackages()]:
+        p = Path(sp) / "mlx_lm" / "tuner" / "utils.py"
+        if p.exists():
+            candidates.append(p)
+    # Also check relative to the running python
+    py = Path(sys.executable)
+    for parent in [py.parent, py.parent.parent]:
+        p = parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "mlx_lm" / "tuner" / "utils.py"
+        if p.exists():
+            candidates.append(p)
+        # venv style
+        for lib in parent.glob("lib/python*/site-packages/mlx_lm/tuner/utils.py"):
+            candidates.append(lib)
 
+    if not candidates:
+        print("    ⚠️   Could not locate mlx_lm/tuner/utils.py — skipping disk patch")
+        return False
+
+    utils_file = candidates[0]
+    src = utils_file.read_text()
+
+    # Check if already patched
+    if "num_hidden_layers" in src and "AI4BHARAT_PATCH" in src:
+        print(f"    ✅  mlx_lm already patched")
+        return True
+
+    # The buggy line is: config.num_layers,
+    # (inside _load_adapters / load_adapters)
+    # We replace it with a safe getattr
+    OLD = "config.num_layers,"
+    NEW = "getattr(config,'num_layers',getattr(config,'num_hidden_layers',28)),  # AI4BHARAT_PATCH"
+
+    if OLD not in src:
+        # Already fixed upstream, or different version — check if it works
+        print(f"    ℹ️   '{OLD}' not found in utils.py — may be already fixed or different version")
+        return True
+
+    patched = src.replace(OLD, NEW, 1)
+    utils_file.write_text(patched)
+    print(f"    ✅  Patched {utils_file}")
+    return True
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
 def ensure_adapter_config(adapter_dir: Path):
-    """Write adapter_config.json if missing. Required by mlx_lm.fuse."""
     cfg = adapter_dir / "adapter_config.json"
     if not cfg.exists():
         with open(cfg, "w") as f:
@@ -161,141 +157,52 @@ def ensure_adapter_config(adapter_dir: Path):
         print(f"    ✅  adapter_config.json present")
 
 
-def find_adapter_dir(iter_override: int | None) -> tuple[Path, int | str]:
-    """
-    Locate the adapter directory to use.
-    Returns (path, iter_num_or_string).
-
-    Priority:
-      1. --iter N  → use checkpoints/{STATE}/adapters/00N_adapters.safetensors
-                     copied to a temp dir so fuse gets a clean single file
-      2. adapters/{STATE}/  (clean saved adapter from previous save_checkpoint run)
-      3. checkpoints/{STATE}/adapters/  (live rolling latest from training)
-    """
+def find_adapter_dir(iter_override):
     if iter_override is not None:
-        # Find the specific numbered checkpoint file
-        pattern = f"{iter_override:07d}_adapters.safetensors"
-        target  = CKPT_ADAPT / pattern
-        if not target.exists():
-            # Try finding closest match
-            all_numbered = sorted(
-                CKPT_ADAPT.glob("*_adapters.safetensors"),
-                key=lambda f: int(f.stem.split("_")[0])
-                              if f.stem.split("_")[0].isdigit() else 0
-            )
-            if not all_numbered:
-                print(f"❌  No numbered checkpoints found in {CKPT_ADAPT}/")
-                sys.exit(1)
-            # Pick closest
-            target = min(all_numbered,
-                         key=lambda f: abs(int(f.stem.split("_")[0]) - iter_override))
-            actual = int(target.stem.split("_")[0])
-            print(f"⚠️   iter {iter_override} not found — using closest: iter {actual:,}")
-            iter_override = actual
-
-        # Copy the numbered file as adapters.safetensors into a temp dir
-        # alongside adapter_config.json so fuse can load it
-        tmp_dir = Path(f"checkpoints/{STATE}/_tmp_iter_{iter_override}")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target, tmp_dir / "adapters.safetensors")
-        print(f"📂  Using checkpoint iter {iter_override:,}")
-        print(f"    {target}")
-        return tmp_dir, iter_override
+        numbered = sorted(
+            CKPT_ADAPT.glob("*_adapters.safetensors"),
+            key=lambda f: int(f.stem.split("_")[0]) if f.stem.split("_")[0].isdigit() else 0
+        )
+        if not numbered:
+            print(f"❌  No numbered checkpoints in {CKPT_ADAPT}/"); sys.exit(1)
+        target = min(numbered, key=lambda f: abs(int(f.stem.split("_")[0]) - iter_override))
+        actual = int(target.stem.split("_")[0])
+        tmp = Path(f"checkpoints/{STATE}/_tmp_{actual}")
+        tmp.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, tmp / "adapters.safetensors")
+        print(f"📂  Checkpoint iter {actual:,}  →  {target.name}")
+        return tmp, actual
 
     if ADAPT_DIR.exists() and any(ADAPT_DIR.glob("*.safetensors")):
-        print(f"📂  Using saved adapter: {ADAPT_DIR}/")
-        return ADAPT_DIR, "saved adapter"
+        print(f"📂  Saved adapter: {ADAPT_DIR}/")
+        return ADAPT_DIR, "saved"
 
     if CKPT_ADAPT.exists() and any(CKPT_ADAPT.glob("*.safetensors")):
         numbered = sorted(
             CKPT_ADAPT.glob("*_adapters.safetensors"),
-            key=lambda f: int(f.stem.split("_")[0])
-                          if f.stem.split("_")[0].isdigit() else 0
+            key=lambda f: int(f.stem.split("_")[0]) if f.stem.split("_")[0].isdigit() else 0
         )
-        iter_num = int(numbered[-1].stem.split("_")[0]) if numbered else "?"
-        print(f"📂  Using latest checkpoint: iter {iter_num:,}")
+        n = int(numbered[-1].stem.split("_")[0]) if numbered else "?"
+        print(f"📂  Latest checkpoint: iter {n}")
         print(f"    {CKPT_ADAPT}/")
-        return CKPT_ADAPT, iter_num
+        return CKPT_ADAPT, n
 
-    print(f"\n❌  No adapter found.")
-    print(f"    Looked in:")
-    print(f"      {ADAPT_DIR}/")
-    print(f"      {CKPT_ADAPT}/")
-    sys.exit(1)
-
-
-def patch_mlx_lm():
-    """
-    Patch mlx_lm to handle Qwen3's config format.
-
-    mlx_lm/tuner/utils.py _load_adapters does: config.num_layers
-    Qwen3's config.json uses "num_hidden_layers" not "num_layers".
-    This causes: AttributeError: 'SimpleNamespace' has no attribute 'num_layers'
-
-    Fix: wrap _load_adapters to copy num_hidden_layers → num_layers
-    before the original function runs. Must be called before any mlx_lm import.
-    """
-    try:
-        import mlx_lm.tuner.utils as tu
-        _orig = tu._load_adapters
-
-        def _patched(model, adapter_path):
-            # Copy num_hidden_layers → num_layers for Qwen/Mistral-style configs
-            cfg = getattr(model, "config", None) or getattr(model, "args", None)
-            if cfg is not None:
-                if hasattr(cfg, "num_hidden_layers") and not hasattr(cfg, "num_layers"):
-                    cfg.num_layers = cfg.num_hidden_layers
-            return _orig(model, adapter_path)
-
-        tu._load_adapters = _patched
-        print(f"    🔧  Patched mlx_lm for Qwen3 config compatibility")
-    except Exception as e:
-        print(f"    ⚠️   Could not patch mlx_lm: {e} (will try anyway)")
+    print(f"❌  No adapter found in {ADAPT_DIR}/ or {CKPT_ADAPT}/"); sys.exit(1)
 
 
 def fuse_adapter(adapter_dir: Path) -> bool:
-    """
-    Merge LoRA adapter into base model → MERGE_DIR using mlx_lm fuse.
-    Patches mlx_lm first to fix the num_layers AttributeError on Qwen3.
-    Returns True on success.
-    """
     MERGE_DIR.mkdir(parents=True, exist_ok=True)
-
     print(f"\n🔀  Merging LoRA → FP16")
     print(f"    adapter : {adapter_dir}/")
     print(f"    output  : {MERGE_DIR}/")
     print(f"    (takes 2-5 min...)\n")
 
-    # Apply patch BEFORE importing fuse
-    patch_mlx_lm()
+    # Patch the installed mlx_lm file on disk first
+    # This fixes both the Python API and subprocess calls
+    print(f"🔧  Patching mlx_lm for Qwen3 compatibility...")
+    patch_mlx_lm_on_disk()
 
-    # Try Python API with patch applied
-    try:
-        from mlx_lm.fuse import main as fuse_main
-        import sys as _sys
-        _argv_backup = _sys.argv
-        _sys.argv = [
-            "fuse",
-            "--model",        MODEL_ID,
-            "--adapter-path", str(adapter_dir),
-            "--save-path",    str(MERGE_DIR),
-            "--dequantize",
-        ]
-        fuse_main()
-        _sys.argv = _argv_backup
-        print(f"\n    ✅  Merge complete")
-        return True
-    except SystemExit as e:
-        if e.code == 0:
-            print(f"\n    ✅  Merge complete")
-            return True
-        print(f"    ⚠️   fuse exited with code {e.code}, trying subprocess...")
-    except Exception as e:
-        print(f"    ⚠️   Python API failed: {e}")
-        print(f"    Trying subprocess...")
-
-    # Subprocess fallback — patch can't help here, but try anyway
-    # Note: "python -m mlx_lm fuse" (space, not dot)
+    # Run fuse via subprocess (clean process picks up the disk patch)
     result = subprocess.run(
         [sys.executable, "-m", "mlx_lm", "fuse",
          "--model",        MODEL_ID,
@@ -309,8 +216,7 @@ def fuse_adapter(adapter_dir: Path) -> bool:
         print(f"\n    ✅  Merge complete")
         return True
 
-    print(f"\n    ❌  Merge failed.")
-    print(f"    Run manually after applying the patch:")
+    print(f"\n    ❌  Merge failed. Run manually:")
     print(f"      python -m mlx_lm fuse \\")
     print(f"        --model {MODEL_ID} \\")
     print(f"        --adapter-path {adapter_dir} \\")
@@ -320,66 +226,32 @@ def fuse_adapter(adapter_dir: Path) -> bool:
 
 
 def upload_merged(repo_id: str, iter_num) -> bool:
-    """Upload MERGE_DIR contents to Hub. Returns True on success."""
-    print(f"\n📤  Uploading merged model → {repo_id}")
-    print(f"    (uploading ~1GB, takes a few minutes...)")
+    print(f"\n📤  Uploading → {repo_id}  (~1GB, few minutes...)")
     try:
         api = HfApi()
-
-        # Always create repo first — harmless if it already exists.
-        # Required for org repos (srmsit/...) which don't auto-create.
-        print(f"    Creating repo if needed...")
+        print(f"    Creating repo...")
         api.create_repo(repo_id=repo_id, repo_type="model",
                         token=HF_TOKEN, exist_ok=True)
-        print(f"    ✅  Repo ready")
-
-        # Write README into MERGE_DIR before upload
-        readme = MERGE_DIR / "README.md"
-        readme.write_text(make_readme(repo_id, iter_num))
-
-        # Write adapter_config.json into MERGE_DIR too
-        cfg = MERGE_DIR / "adapter_config.json"
-        with open(cfg, "w") as f:
+        (MERGE_DIR / "README.md").write_text(make_readme(repo_id, iter_num))
+        with open(MERGE_DIR / "adapter_config.json", "w") as f:
             json.dump(ADAPTER_CONFIG, f, indent=2)
-
-        api.upload_folder(
-            folder_path=str(MERGE_DIR),
-            repo_id=repo_id,
-            repo_type="model",
-            token=HF_TOKEN,
-        )
+        api.upload_folder(folder_path=str(MERGE_DIR), repo_id=repo_id,
+                          repo_type="model", token=HF_TOKEN)
         print(f"    🎉  https://huggingface.co/{repo_id}")
         return True
     except Exception as e:
         print(f"    ❌  Upload failed: {e}")
-        print(f"    Merged model is at {MERGE_DIR}/ — retry when network is available.")
+        print(f"    Model saved at {MERGE_DIR}/ — retry: python upload_model.py --adapter-path {MERGE_DIR}")
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────
-
+# ── Main ──────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="Merge LoRA adapter and upload full model to HuggingFace Hub",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  python upload_model.py                        # auto-detect latest, merge, upload
-  python upload_model.py --no-upload            # merge only, check before uploading  
-  python upload_model.py --iter 3400            # use iter 3400 checkpoint specifically
-  python upload_model.py --adapter-path adapters/Tamil_Nadu  # use explicit path
-        """,
-    )
-    parser.add_argument("--no-upload",    action="store_true",
-                        help="Merge only — don't upload to Hub")
-    parser.add_argument("--iter",         type=int, default=None,
-                        help="Use a specific numbered checkpoint (e.g. --iter 3400)")
-    parser.add_argument("--adapter-path", type=str, default=None,
-                        help="Explicit adapter directory path")
-    parser.add_argument("--keep-merged",  action="store_true",
-                        help="Don't delete local merged dir after upload")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-upload",    action="store_true")
+    parser.add_argument("--iter",         type=int,  default=None)
+    parser.add_argument("--adapter-path", type=str,  default=None)
+    parser.add_argument("--keep-merged",  action="store_true")
     args = parser.parse_args()
 
     repo_id = f"{HF_USERNAME}/{PROJECT_NAME}-{STATE}"
@@ -387,61 +259,47 @@ examples:
     print(f"\n{'═'*64}")
     print(f"  🚀  Upload Full Model  —  {STATE}")
     print(f"{'─'*64}")
-    print(f"  Base      : {MODEL_ID}")
-    print(f"  Output    : {MERGE_DIR}/")
+    print(f"  Base   : {MODEL_ID}")
+    print(f"  Output : {MERGE_DIR}/")
     if not args.no_upload:
-        print(f"  Hub       : https://huggingface.co/{repo_id}")
+        print(f"  Hub    : https://huggingface.co/{repo_id}")
     print(f"{'═'*64}\n")
 
-    # ── 1. Find adapter dir ───────────────────────────────────
     if args.adapter_path:
         adapter_dir = Path(args.adapter_path)
         if not adapter_dir.exists():
-            print(f"❌  Path not found: {adapter_dir}")
-            sys.exit(1)
+            print(f"❌  Not found: {adapter_dir}"); sys.exit(1)
         print(f"📂  Using: {adapter_dir}/")
-        iter_num = "custom path"
+        iter_num = "custom"
     else:
         adapter_dir, iter_num = find_adapter_dir(args.iter)
 
-    # ── 2. Ensure adapter_config.json ────────────────────────
     print(f"\n🔧  Checking adapter_config.json...")
     ensure_adapter_config(adapter_dir)
 
-    # ── 3. Merge ──────────────────────────────────────────────
     if not fuse_adapter(adapter_dir):
         sys.exit(1)
 
-    # ── 4. Clean tmp dir if we created one ───────────────────
-    tmp_dir = Path(f"checkpoints/{STATE}/_tmp_iter_{args.iter}")
-    if args.iter and tmp_dir.exists():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    # Clean temp dir if created for --iter
+    if args.iter:
+        tmp = Path(f"checkpoints/{STATE}/_tmp_{args.iter}")
+        shutil.rmtree(tmp, ignore_errors=True)
 
-    # ── 5. Upload ─────────────────────────────────────────────
     if args.no_upload:
-        print(f"\n{'═'*64}")
-        print(f"  ✅  Merge done  (--no-upload: skipped Hub upload)")
-        print(f"  📁  {MERGE_DIR}/")
-        print(f"\n  To upload:")
-        print(f"    python upload_model.py --adapter-path {adapter_dir}")
-        print(f"{'═'*64}\n")
+        print(f"\n✅  Merge done. Skipped upload (--no-upload).")
+        print(f"📁  {MERGE_DIR}/")
         return
 
     login(token=HF_TOKEN)
     ok = upload_merged(repo_id, iter_num)
 
-    # ── 6. Clean up merged dir ────────────────────────────────
     if ok and not args.keep_merged:
         shutil.rmtree(str(MERGE_DIR), ignore_errors=True)
         print(f"    🧹  Local merged dir cleaned")
 
     print(f"\n{'═'*64}")
-    if ok:
-        print(f"  🏁  Done!")
-        print(f"  🔗  https://huggingface.co/{repo_id}")
-    else:
-        print(f"  ⚠️   Upload failed — merged model is at {MERGE_DIR}/")
-        print(f"  Retry: python upload_model.py --adapter-path {MERGE_DIR}")
+    print(f"  🏁  {'Done!' if ok else 'Upload failed — see above'}")
+    if ok: print(f"  🔗  https://huggingface.co/{repo_id}")
     print(f"{'═'*64}\n")
 
 
