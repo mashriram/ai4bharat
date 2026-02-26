@@ -224,22 +224,78 @@ def find_adapter_dir(iter_override: int | None) -> tuple[Path, int | str]:
     sys.exit(1)
 
 
+def patch_mlx_lm():
+    """
+    Patch mlx_lm to handle Qwen3's config format.
+
+    mlx_lm/tuner/utils.py _load_adapters does: config.num_layers
+    Qwen3's config.json uses "num_hidden_layers" not "num_layers".
+    This causes: AttributeError: 'SimpleNamespace' has no attribute 'num_layers'
+
+    Fix: wrap _load_adapters to copy num_hidden_layers → num_layers
+    before the original function runs. Must be called before any mlx_lm import.
+    """
+    try:
+        import mlx_lm.tuner.utils as tu
+        _orig = tu._load_adapters
+
+        def _patched(model, adapter_path):
+            # Copy num_hidden_layers → num_layers for Qwen/Mistral-style configs
+            cfg = getattr(model, "config", None) or getattr(model, "args", None)
+            if cfg is not None:
+                if hasattr(cfg, "num_hidden_layers") and not hasattr(cfg, "num_layers"):
+                    cfg.num_layers = cfg.num_hidden_layers
+            return _orig(model, adapter_path)
+
+        tu._load_adapters = _patched
+        print(f"    🔧  Patched mlx_lm for Qwen3 config compatibility")
+    except Exception as e:
+        print(f"    ⚠️   Could not patch mlx_lm: {e} (will try anyway)")
+
+
 def fuse_adapter(adapter_dir: Path) -> bool:
     """
-    Run mlx_lm.fuse to merge LoRA weights into base model → MERGE_DIR.
-    Uses --dequantize (NOT --de-quantize) for FP16 output.
+    Merge LoRA adapter into base model → MERGE_DIR using mlx_lm fuse.
+    Patches mlx_lm first to fix the num_layers AttributeError on Qwen3.
     Returns True on success.
     """
     MERGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n🔀  Merging LoRA → FP16 via mlx_lm fuse")
+    print(f"\n🔀  Merging LoRA → FP16")
     print(f"    adapter : {adapter_dir}/")
     print(f"    output  : {MERGE_DIR}/")
     print(f"    (takes 2-5 min...)\n")
 
-    # mlx_lm.fuse is NOT a callable function — it's a CLI module.
-    # The correct invocation is: python -m mlx_lm fuse  (space, not dot)
-    # Note: --dequantize (no hyphen between de and quantize)
+    # Apply patch BEFORE importing fuse
+    patch_mlx_lm()
+
+    # Try Python API with patch applied
+    try:
+        from mlx_lm.fuse import main as fuse_main
+        import sys as _sys
+        _argv_backup = _sys.argv
+        _sys.argv = [
+            "fuse",
+            "--model",        MODEL_ID,
+            "--adapter-path", str(adapter_dir),
+            "--save-path",    str(MERGE_DIR),
+            "--dequantize",
+        ]
+        fuse_main()
+        _sys.argv = _argv_backup
+        print(f"\n    ✅  Merge complete")
+        return True
+    except SystemExit as e:
+        if e.code == 0:
+            print(f"\n    ✅  Merge complete")
+            return True
+        print(f"    ⚠️   fuse exited with code {e.code}, trying subprocess...")
+    except Exception as e:
+        print(f"    ⚠️   Python API failed: {e}")
+        print(f"    Trying subprocess...")
+
+    # Subprocess fallback — patch can't help here, but try anyway
+    # Note: "python -m mlx_lm fuse" (space, not dot)
     result = subprocess.run(
         [sys.executable, "-m", "mlx_lm", "fuse",
          "--model",        MODEL_ID,
@@ -254,7 +310,7 @@ def fuse_adapter(adapter_dir: Path) -> bool:
         return True
 
     print(f"\n    ❌  Merge failed.")
-    print(f"    Run manually:")
+    print(f"    Run manually after applying the patch:")
     print(f"      python -m mlx_lm fuse \\")
     print(f"        --model {MODEL_ID} \\")
     print(f"        --adapter-path {adapter_dir} \\")
