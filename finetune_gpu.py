@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import unsloth
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║     AI4BHARAT TUNE-ATHON  —  GPU FINETUNE SCRIPT  v1.0                 ║
